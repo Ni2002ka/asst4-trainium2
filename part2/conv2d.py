@@ -101,19 +101,27 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
                     for i in nl.affine_range(filter_height):
                         # Iterate over the filter width
                         for j in nl.affine_range(filter_width):
-                            lhsT_tile = nl.ndarray((TILE_M, TILE_K), dtype=W.dtype, buffer=nl.sbuf)
+                            lhsT_tile = nl.ndarray((TILE_K, TILE_M), dtype=W.dtype, buffer=nl.sbuf)
                             rhs_tile = nl.ndarray((TILE_K, TILE_N), dtype=X.dtype, buffer=nl.sbuf)
                             w_block = W[m * TILE_M:(m + 1) * TILE_M, k * TILE_K:(k + 1) * TILE_K, i, j]
+                            w_block_sbuf = nl.ndarray(
+                                        shape=(TILE_M, TILE_K),
+                                        dtype=W.dtype,
+                                        buffer=nl.sbuf,
+                                    )
+                            nisa.dma_copy(dst=w_block_sbuf, src=w_block)
+                            w_block_transposed = nisa.nc_transpose(w_block_sbuf) # This lives in psum
+                            lhsT_tile = nisa.tensor_copy(w_block_transposed) # Move to sbuf
 
                             # Shift the Input tensor by (i, j) to align with the filter's current position
                             input_shifted = X[b, :, i:i+out_height, j:j+out_width]
 
                             # Load tiles from lhsT and rhs
-                            nisa.dma_copy(dst=lhsT_tile, src=w_block)
+                            # nisa.dma_copy(dst=lhsT_tile, src=w_block_transposed)
                             nisa.dma_copy(dst=rhs_tile, src=input_shifted[k * TILE_K:(k + 1) * TILE_K, row_idx, col_start:col_start+TILE_N])
 
                             # Accumulate partial-sums into PSUM
-                            res_psum += nisa.nc_matmul(lhsT_tile, rhs_tile, is_transpose=True)
+                            res_psum += nisa.nc_matmul(lhsT_tile, rhs_tile)
 
                 # Copy block m,n to output. PSUM->SBUF->output
                 res_sb = nisa.tensor_copy(res_psum)
@@ -123,3 +131,5 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
 
 
     return X_out
+
+
