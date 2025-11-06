@@ -73,11 +73,7 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
     TILE_M = nl.tile_size.gemm_stationary_fmax  # 128
     TILE_K = nl.tile_size.pmax  # 128
     # TILE_N = nl.tile_size.gemm_moving_fmax  # 512
-    TILE_N = 12
-    
-    output_flat = nl.ndarray(shape=(out_channels, out_height * out_width),
-                        dtype=X.dtype,
-                        buffer=nl.hbm,)
+    TILE_N = out_width # TODO: handle case where width exceeds 512
 
     # Define matmul shapes
     K = in_channels
@@ -95,47 +91,35 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
         for m in nl.affine_range(M // TILE_M):
 
             for n in nl.affine_range(N // TILE_N):
+                # Figure out the mapping of the flattened arrays
+                row_idx = n * TILE_N // out_width
+                col_start = n * TILE_N % out_width
 
                 res_psum = nl.zeros((TILE_M, TILE_N), nl.float32, buffer=nl.psum)
                 for k in nl.affine_range(K // TILE_K):
-                    lhsT_tile = nl.ndarray((TILE_M, TILE_K), dtype=W.dtype, buffer=nl.sbuf)
-                    rhs_tile = nl.ndarray((TILE_K, TILE_N), dtype=X.dtype, buffer=nl.sbuf)
                     # Iterate over the filter height
                     for i in nl.affine_range(filter_height):
                         # Iterate over the filter width
                         for j in nl.affine_range(filter_width):
+                            lhsT_tile = nl.ndarray((TILE_M, TILE_K), dtype=W.dtype, buffer=nl.sbuf)
+                            rhs_tile = nl.ndarray((TILE_K, TILE_N), dtype=X.dtype, buffer=nl.sbuf)
                             w_block = W[m * TILE_M:(m + 1) * TILE_M, k * TILE_K:(k + 1) * TILE_K, i, j]
 
                             # Shift the Input tensor by (i, j) to align with the filter's current position
                             input_shifted = X[b, :, i:i+out_height, j:j+out_width]
-                            # Flatten the shifted input before the matmul
-                            input_shifted_flat = input_shifted.reshape((in_channels, out_height * out_width))
 
                             # Load tiles from lhsT and rhs
                             nisa.dma_copy(dst=lhsT_tile, src=w_block)
-                            nisa.dma_copy(dst=rhs_tile, src=input_shifted_flat[k * TILE_K:(k + 1) * TILE_K, n * TILE_N:(n + 1) * TILE_N])
+                            nisa.dma_copy(dst=rhs_tile, src=input_shifted[k * TILE_K:(k + 1) * TILE_K, row_idx, col_start:col_start+TILE_N])
 
                             # Accumulate partial-sums into PSUM
                             res_psum += nisa.nc_matmul(lhsT_tile, rhs_tile, is_transpose=True)
 
-                            # accumulate in total output
-                # Copy block m,n to output. PSUM->SBUF->output_flat
+                # Copy block m,n to output. PSUM->SBUF->output
                 res_sb = nisa.tensor_copy(res_psum)
-                # row_idx = n * TILE_N // out_pool_width
-                # col_start = n * TILE_N % out_pool_width
-                # nisa.dma_copy(dst=X_out[b, m * TILE_M:(m + 1) * TILE_M, row_idx, col_start:col_start+TILE_N], src=res_sb)
-                nisa.dma_copy(dst=output_flat[m * TILE_M:(m + 1) * TILE_M, n * TILE_N:(n + 1) * TILE_N], src=res_sb)
+                nisa.dma_copy(dst=X_out[b, m * TILE_M:(m + 1) * TILE_M, row_idx, col_start:col_start+TILE_N], src=res_sb)
+                
         # TODO: implement pooling
-        # out_img = output_flat.reshape((out_channels, out_height, out_width))
-        out_img = output_flat.reshape((out_channels, out_height, out_width))
 
-        # Allocate a scratch buffer of the same shape
-        tmp_sbuf = nl.ndarray(out_img.shape, dtype=out_img.dtype, buffer=nl.sbuf)
-
-        # Copy HBM -> SBUF -> HBM
-        nl.device_print("bruh", tmp_sbuf)
-        nisa.dma_copy(dst=tmp_sbuf, src=out_img)
-        nisa.dma_copy(dst=X_out[b, :, :, :], src=tmp_sbuf)
-        # nisa.dma_copy(dst=X_out[b, :, :, :], src=out_img)
 
     return X_out
