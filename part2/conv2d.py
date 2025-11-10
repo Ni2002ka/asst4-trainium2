@@ -88,12 +88,11 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
     for b in nl.affine_range(batch_size):
 
         for m in nl.affine_range(M // TILE_M):
-
-            for n in nl.affine_range(N // TILE_N):
-                # Figure out the mapping of the flattened arrays
-                row_idx = n * TILE_N // out_width
-                col_start = n * TILE_N % out_width
-
+            
+            # Tile one row at a time
+            for row_idx in nl.affine_range(out_height):
+                if pool_size == 2:
+                    max_psum = nl.zeros((TILE_M, TILE_N // 4), nl.float32, buffer=nl.psum)
                 res_psum = nl.zeros((TILE_M, TILE_N), nl.float32, buffer=nl.psum)
 
                 for k in nl.affine_range(K // TILE_K):
@@ -118,11 +117,18 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
 
                             # Load tiles from lhsT and rhs
                             # nisa.dma_copy(dst=lhsT_tile, src=w_block_transposed)
-                            nisa.dma_copy(dst=rhs_tile, src=input_shifted[k * TILE_K:(k + 1) * TILE_K, row_idx, col_start:col_start+TILE_N])
+                            nisa.dma_copy(dst=rhs_tile, src=input_shifted[k * TILE_K:(k + 1) * TILE_K, row_idx, :])
 
                             # Accumulate partial-sums into PSUM
                             res_psum += nisa.nc_matmul(lhsT_tile, rhs_tile)
 
+                # Maxpool once we have enough rows, if needed
+                if pool_size == 2:
+                    if row_idx % pool_size == 0:
+                        max_tmp_psum = nisa.tensor_tensor(res_psum[:, 0:-1:2], res_psum[:, 1:-1:2], op=nl.max)
+                    else:
+                        max_blocks_psum = nisa.tensor_tensor(res_psum[:, 0:-1:2], res_psum[:, 1:-1:2], op=nl.max)
+                        res_psum = nisa.tensor_tensor(max_tmp_psum, max_blocks_psum, op=nl.max)
                 # Copy block m,n to output. PSUM->SBUF
                 bias_tile_sbuf = nl.zeros(TILE_M, dtype=bias.dtype, buffer=nl.sbuf)
                 # res_sb = nisa.tensor_copy(res_psum)
@@ -130,7 +136,7 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
                 for nn in nl.affine_range(TILE_N):
                     res_sb = nisa.tensor_tensor(res_psum[:, nn], bias_tile_sbuf, op=nl.add)
                     
-                nisa.dma_copy(dst=X_out[b, m * TILE_M:(m + 1) * TILE_M, row_idx, col_start:col_start+TILE_N], src=res_sb)
+                nisa.dma_copy(dst=X_out[b, m * TILE_M:(m + 1) * TILE_M, row_idx, :], src=res_sb)
                 
         # TODO: implement pooling
 
