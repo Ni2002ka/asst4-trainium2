@@ -72,8 +72,7 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
     n_tiles_c_in = in_channels // c_in_pmax
     TILE_M = nl.tile_size.gemm_stationary_fmax  # 128
     TILE_K = nl.tile_size.pmax  # 128
-    # TILE_N = nl.tile_size.gemm_moving_fmax  # 512
-    TILE_N = out_width # TODO: handle case where width exceeds 512
+    TILE_N = out_width # Can do this because PSUM can fit a full row
 
     # Define matmul shapes
     K = in_channels
