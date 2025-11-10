@@ -95,6 +95,7 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
                 col_start = n * TILE_N % out_width
 
                 res_psum = nl.zeros((TILE_M, TILE_N), nl.float32, buffer=nl.psum)
+
                 for k in nl.affine_range(K // TILE_K):
                     # Iterate over the filter height
                     for i in nl.affine_range(filter_height):
@@ -122,8 +123,13 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
                             # Accumulate partial-sums into PSUM
                             res_psum += nisa.nc_matmul(lhsT_tile, rhs_tile)
 
-                # Copy block m,n to output. PSUM->SBUF->output
-                res_sb = nisa.tensor_copy(res_psum)
+                # Copy block m,n to output. PSUM->SBUF
+                bias_tile_sbuf = nl.zeros(TILE_M, dtype=bias.dtype, buffer=nl.sbuf)
+                # res_sb = nisa.tensor_copy(res_psum)
+                res_sb = nl.zeros((TILE_M, TILE_N), dtype=bias.dtype, buffer=nl.sbuf)
+                for nn in nl.affine_range(TILE_N):
+                    res_sb = nisa.tensor_tensor(res_psum[:, nn], bias_tile_sbuf, op=nl.add)
+                    
                 nisa.dma_copy(dst=X_out[b, m * TILE_M:(m + 1) * TILE_M, row_idx, col_start:col_start+TILE_N], src=res_sb)
                 
         # TODO: implement pooling
