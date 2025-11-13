@@ -84,9 +84,6 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
     assert N % TILE_N == 0, "out_height*out_width not multiple of TILE_N"
 
     bias_sbuf = nl.ndarray((TILE_M, M // TILE_M), dtype=bias.dtype, buffer=nl.sbuf)
-    bias_broadcast_sbuf = nl.ndarray(
-        (TILE_M, M // TILE_M, TILE_N), dtype=bias.dtype, buffer=nl.sbuf
-    )
     w_transposed_sbuf = nl.ndarray((TILE_K, K // TILE_K, TILE_M, M // TILE_M, filter_height, filter_width), dtype=W.dtype, buffer=nl.sbuf)
     # Keep W and bias in sbuf 
     for m in nl.affine_range(M // TILE_M):
@@ -118,8 +115,6 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
                 prev_pool_row = nl.ndarray((TILE_M, TILE_N // pool_size, 1), dtype=bias.dtype, buffer=nl.sbuf) 
             # Tile one row at a time
             for row_idx in nl.affine_range(out_height):
-                # if pool_size == 2:
-                #     max_psum = nl.zeros((TILE_M, TILE_N // 4), nl.float32, buffer=nl.psum)
                 res_psum = nl.zeros((TILE_M, TILE_N), nl.float32, buffer=nl.psum)
 
                 for k in nl.affine_range(K // TILE_K):
@@ -130,7 +125,6 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
                             lhsT_tile = nl.ndarray((TILE_K, TILE_M), dtype=W.dtype, buffer=nl.sbuf)
                             rhs_tile = nl.ndarray((TILE_K, TILE_N), dtype=X.dtype, buffer=nl.sbuf)
 
-                            
 
                             # Shift the Input tensor by (i, j) to align with the filter's current position
                             input_shifted = X[b, :, i:i+out_height, j:j+out_width]
