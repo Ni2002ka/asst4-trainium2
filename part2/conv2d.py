@@ -55,7 +55,7 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
     assert in_channels % 128 == out_channels % 128 == 0
 
     # TODO: add pooling
-    assert pool_size == 1
+    # assert pool_size == 1
 
     # Can assume one PSUM bank can at least fit one row of the pixels
     assert nl.tile_size.gemm_moving_fmax >= out_width
@@ -83,16 +83,43 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
     assert K % TILE_K == 0, "in_channels not multiple of TILE_K"
     assert N % TILE_N == 0, "out_height*out_width not multiple of TILE_N"
 
-
+    bias_sbuf = nl.ndarray((TILE_M, M // TILE_M), dtype=bias.dtype, buffer=nl.sbuf)
+    bias_broadcast_sbuf = nl.ndarray(
+        (TILE_M, M // TILE_M, TILE_N), dtype=bias.dtype, buffer=nl.sbuf
+    )
+    w_transposed_sbuf = nl.ndarray((TILE_K, K // TILE_K, TILE_M, M // TILE_M, filter_height, filter_width), dtype=W.dtype, buffer=nl.sbuf)
+    # Keep W and bias in sbuf 
+    for m in nl.affine_range(M // TILE_M):
+        nisa.dma_copy(dst=bias_sbuf[:, m], src=bias[m * TILE_M:(m + 1) * TILE_M])
+        for k in nl.affine_range(K // TILE_K):
+            for i in nl.affine_range(filter_height):
+                for j in nl.affine_range(filter_width):
+                    w_block = W[m * TILE_M:(m + 1) * TILE_M, k * TILE_K:(k + 1) * TILE_K, i, j]
+                    w_block_sbuf = nl.ndarray(
+                                shape=(TILE_M, TILE_K),
+                                dtype=W.dtype,
+                                buffer=nl.sbuf,
+                            )
+                    nisa.dma_copy(dst=w_block_sbuf, src=w_block)
+                    w_block_transposed = nisa.nc_transpose(w_block_sbuf)
+                    w_transposed_sbuf[:, k, :, m, i, j] = nisa.tensor_copy(w_block_transposed)
+                    
     # Process the images in batches
     for b in nl.affine_range(batch_size):
 
         for m in nl.affine_range(M // TILE_M):
-            
+
+            bias_tile_sbuf = bias_sbuf[:, m]
+            bias_broadcast = nl.ndarray((TILE_M, TILE_N), dtype=bias.dtype, buffer=nl.sbuf)
+            for col in nl.affine_range(TILE_N):
+                bias_broadcast[:, col] = bias_tile_sbuf
+
+            if pool_size == 2:
+                prev_pool_row = nl.ndarray((TILE_M, TILE_N // pool_size, 1), dtype=bias.dtype, buffer=nl.sbuf) 
             # Tile one row at a time
             for row_idx in nl.affine_range(out_height):
-                if pool_size == 2:
-                    max_psum = nl.zeros((TILE_M, TILE_N // 4), nl.float32, buffer=nl.psum)
+                # if pool_size == 2:
+                #     max_psum = nl.zeros((TILE_M, TILE_N // 4), nl.float32, buffer=nl.psum)
                 res_psum = nl.zeros((TILE_M, TILE_N), nl.float32, buffer=nl.psum)
 
                 for k in nl.affine_range(K // TILE_K):
@@ -102,43 +129,44 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
                         for j in nl.affine_range(filter_width):
                             lhsT_tile = nl.ndarray((TILE_K, TILE_M), dtype=W.dtype, buffer=nl.sbuf)
                             rhs_tile = nl.ndarray((TILE_K, TILE_N), dtype=X.dtype, buffer=nl.sbuf)
-                            w_block = W[m * TILE_M:(m + 1) * TILE_M, k * TILE_K:(k + 1) * TILE_K, i, j]
-                            w_block_sbuf = nl.ndarray(
-                                        shape=(TILE_M, TILE_K),
-                                        dtype=W.dtype,
-                                        buffer=nl.sbuf,
-                                    )
-                            nisa.dma_copy(dst=w_block_sbuf, src=w_block)
-                            w_block_transposed = nisa.nc_transpose(w_block_sbuf) # This lives in psum
-                            lhsT_tile = nisa.tensor_copy(w_block_transposed) # Move to sbuf
+
+                            
 
                             # Shift the Input tensor by (i, j) to align with the filter's current position
                             input_shifted = X[b, :, i:i+out_height, j:j+out_width]
+                            lhsT_tile = w_transposed_sbuf[:, k, :, m, i, j]
 
                             # Load tiles from lhsT and rhs
-                            # nisa.dma_copy(dst=lhsT_tile, src=w_block_transposed)
-                            nisa.dma_copy(dst=rhs_tile, src=input_shifted[k * TILE_K:(k + 1) * TILE_K, row_idx, :])
+                            nisa.dma_copy(dst=rhs_tile, src=input_shifted[k * TILE_K:(k + 1) * TILE_K, row_idx, 0:out_width])
 
                             # Accumulate partial-sums into PSUM
                             res_psum += nisa.nc_matmul(lhsT_tile, rhs_tile)
 
-                # Maxpool once we have enough rows, if needed
+                res_sb = nisa.tensor_tensor(res_psum, bias_broadcast, dtype=bias.dtype, op=nl.add)
+                # Maxpool
                 if pool_size == 2:
-                    if row_idx % pool_size == 0:
-                        max_tmp_psum = nisa.tensor_tensor(res_psum[:, 0:-1:2], res_psum[:, 1:-1:2], op=nl.max)
+                    pooled_w = nisa.tensor_tensor(
+                        res_sb[:, 0:out_width:2],
+                        res_sb[:, 1:out_width:2],
+                        op=nl.maximum
+                    )
+
+                    if (row_idx % 2) == 0:
+                        # store even row for next pooling step
+                        prev_pool_row[:, :, row_idx % 2] = pooled_w 
                     else:
-                        max_blocks_psum = nisa.tensor_tensor(res_psum[:, 0:-1:2], res_psum[:, 1:-1:2], op=nl.max)
-                        res_psum = nisa.tensor_tensor(max_tmp_psum, max_blocks_psum, op=nl.max)
-                # Copy block m,n to output. PSUM->SBUF
-                bias_tile_sbuf = nl.zeros(TILE_M, dtype=bias.dtype, buffer=nl.sbuf)
-                # res_sb = nisa.tensor_copy(res_psum)
-                res_sb = nl.zeros((TILE_M, TILE_N), dtype=bias.dtype, buffer=nl.sbuf)
-                for nn in nl.affine_range(TILE_N):
-                    res_sb = nisa.tensor_tensor(res_psum[:, nn], bias_tile_sbuf, op=nl.add)
-                    
-                nisa.dma_copy(dst=X_out[b, m * TILE_M:(m + 1) * TILE_M, row_idx, :], src=res_sb)
-                
-        # TODO: implement pooling
+                        # combine with the stored even row
+                        pooled = nisa.tensor_tensor(prev_pool_row, pooled_w, op=nl.maximum)
+                        nisa.dma_copy(
+                            dst=X_out[b, m*TILE_M:(m+1)*TILE_M, row_idx//2, :],
+                            src=pooled
+                        )
+                else:
+                    nisa.dma_copy(
+                        dst=X_out[b, m*TILE_M:(m+1)*TILE_M, row_idx, :],
+                        src=res_sb
+                    )
+
 
 
     return X_out
