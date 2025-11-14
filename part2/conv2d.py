@@ -54,9 +54,6 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
     # Can assume multiple of 128 to avoid using mask
     assert in_channels % 128 == out_channels % 128 == 0
 
-    # TODO: add pooling
-    # assert pool_size == 1
-
     # Can assume one PSUM bank can at least fit one row of the pixels
     assert nl.tile_size.gemm_moving_fmax >= out_width
 
@@ -89,16 +86,17 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
     for m in nl.affine_range(M // TILE_M):
         nisa.dma_copy(dst=bias_sbuf[:, m], src=bias[m * TILE_M:(m + 1) * TILE_M])
         for k in nl.affine_range(K // TILE_K):
+            w_block = W[m * TILE_M:(m + 1) * TILE_M, k * TILE_K:(k + 1) * TILE_K, :, :]
+            w_block_sbuf = nl.ndarray(
+                        shape=(TILE_M, TILE_K, filter_height, filter_width),
+                        dtype=W.dtype,
+                        buffer=nl.sbuf,
+                    )
+            nisa.dma_copy(dst=w_block_sbuf, src=w_block)
             for i in nl.affine_range(filter_height):
                 for j in nl.affine_range(filter_width):
-                    w_block = W[m * TILE_M:(m + 1) * TILE_M, k * TILE_K:(k + 1) * TILE_K, i, j]
-                    w_block_sbuf = nl.ndarray(
-                                shape=(TILE_M, TILE_K),
-                                dtype=W.dtype,
-                                buffer=nl.sbuf,
-                            )
-                    nisa.dma_copy(dst=w_block_sbuf, src=w_block)
-                    w_block_transposed = nisa.nc_transpose(w_block_sbuf)
+                    
+                    w_block_transposed = nisa.nc_transpose(w_block_sbuf[:, :, i, j])
                     w_transposed_sbuf[:, k, :, m, i, j] = nisa.tensor_copy(w_block_transposed)
                     
     # Process the images in batches
@@ -122,7 +120,7 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
                     for i in nl.affine_range(filter_height):
                         # Iterate over the filter width
                         for j in nl.affine_range(filter_width):
-                            lhsT_tile = nl.ndarray((TILE_K, TILE_M), dtype=W.dtype, buffer=nl.sbuf)
+                            
                             rhs_tile = nl.ndarray((TILE_K, TILE_N), dtype=X.dtype, buffer=nl.sbuf)
 
 
